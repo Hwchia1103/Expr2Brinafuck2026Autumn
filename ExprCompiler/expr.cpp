@@ -58,11 +58,6 @@ bool digit(char c) { return c >= '0' && c <= '9'; }
 bool nameStart(char c) { return letter(c) || c == '_'; }
 bool namePart(char c) { return nameStart(c) || digit(c); }
 
-std::string stripComment(std::string_view line) {
-  const auto hash = line.find('#');
-  return std::string(line.substr(0, hash));
-}
-
 std::vector<Token> tokenize(std::string_view line, std::size_t lineNumber) {
   std::vector<Token> tokens;
   for (std::size_t i = 0; i < line.size();) {
@@ -221,7 +216,9 @@ Program parseSource(std::istream &source) {
   std::size_t lineNumber = 0;
   while (std::getline(source, line)) {
     ++lineNumber;
-    auto tokens = tokenize(stripComment(line), lineNumber);
+    if (const auto hash = line.find('#'); hash != std::string::npos)
+      line.erase(hash);
+    auto tokens = tokenize(line, lineNumber);
     if (tokens.size() > 1) program.push_back(Parser(std::move(tokens)).parseStatement());
   }
   if (source.bad()) throw std::runtime_error("failed while reading source file");
@@ -275,9 +272,39 @@ void foldExpr(std::unique_ptr<Expr> &expr) {
   expr->right.reset();
 }
 
-void foldConstants(Program &program) {
-  for (auto &statement : program)
-    if (statement.expr) foldExpr(statement.expr);
+void substituteKnown(std::unique_ptr<Expr> &expr,
+                     const std::unordered_map<std::string, int> &known) {
+  if (expr->kind == Expr::Kind::Variable) {
+    const auto it = known.find(expr->name);
+    if (it != known.end()) {
+      expr->kind = Expr::Kind::Constant;
+      expr->value = it->second;
+      expr->name.clear();
+    }
+    return;
+  }
+  if (expr->left) substituteKnown(expr->left, known);
+  if (expr->right) substituteKnown(expr->right, known);
+}
+
+// Process assignments in source order so an RHS uses the previous value of
+// its destination. Input invalidates a known value but is never removed here.
+void propagateConstants(Program &program) {
+  std::unordered_map<std::string, int> known;
+  for (auto &statement : program) {
+    if (statement.kind == Statement::Kind::Input) {
+      known.erase(statement.target);
+      continue;
+    }
+    substituteKnown(statement.expr, known);
+    foldExpr(statement.expr);
+    if (statement.kind == Statement::Kind::Assign) {
+      if (statement.expr->kind == Expr::Kind::Constant)
+        known[statement.target] = statement.expr->value;
+      else
+        known.erase(statement.target);
+    }
+  }
 }
 
 void collectReads(const Expr &expr, std::unordered_set<std::string> &live) {
@@ -344,12 +371,12 @@ private:
     moveTo(cell);
     output_ += "[-]";
   }
-  void releaseTemp(std::size_t cell) {
-    clear(cell);
+  void releaseTemp(std::size_t cell, bool zero = false) {
+    if (!zero) clear(cell);
     freeTemps_.push_back(cell);
   }
   void setConstant(std::size_t cell, int value) {
-    clear(cell);
+    moveTo(cell); // Every acquired temporary cell starts at zero.
     if (value <= 128) output_.append(static_cast<std::size_t>(value), '+');
     else output_.append(static_cast<std::size_t>(256 - value), '-');
   }
@@ -373,6 +400,39 @@ private:
     moveTo(source); output_ += ']';
     addConsume(scratch, source, false);
   }
+  // Binary multiplication: halve the multiplier and double the multiplicand.
+  std::size_t multiply(std::size_t multiplier, std::size_t multiplicand) {
+    const auto result = acquireTemp();
+    const auto half = acquireTemp();
+    const auto parity = acquireTemp();
+    const auto scratch = acquireTemp();
+    moveTo(multiplier); output_ += "[[";
+    output_ += '-';
+    moveTo(scratch); output_ += '+';
+    moveTo(parity); output_ += "[-";
+    moveTo(half); output_ += '+';
+    moveTo(scratch); output_ += '-';
+    moveTo(parity); output_ += ']';
+    moveTo(scratch); output_ += "[-";
+    moveTo(parity); output_ += '+';
+    moveTo(scratch); output_ += ']';
+    moveTo(multiplier); output_ += ']';
+    addConsume(half, multiplier, false);
+    moveTo(parity); output_ += "[-";
+    copyAdd(multiplicand, result, scratch);
+    moveTo(parity); output_ += ']';
+    moveTo(multiplicand); output_ += "[-";
+    moveTo(scratch); output_ += "++";
+    moveTo(multiplicand); output_ += ']';
+    addConsume(scratch, multiplicand, false);
+    moveTo(multiplier); output_ += ']';
+    releaseTemp(multiplier, true);
+    releaseTemp(multiplicand);
+    releaseTemp(half, true);
+    releaseTemp(parity, true);
+    releaseTemp(scratch, true);
+    return result;
+  }
   std::size_t emitExpr(const Expr &expr) {
     if (expr.kind == Expr::Kind::Constant) {
       const auto result = acquireTemp();
@@ -384,40 +444,62 @@ private:
       const auto result = acquireTemp();
       const auto scratch = acquireTemp();
       copyAdd(source, result, scratch);
-      releaseTemp(scratch);
+      releaseTemp(scratch, true);
       return result;
     }
     if (expr.kind == Expr::Kind::Unary) {
       const auto child = emitExpr(*expr.left);
       if (expr.op == '+') return child;
       const auto result = acquireTemp();
-      clear(result);
       addConsume(child, result, true);
-      releaseTemp(child);
+      releaseTemp(child, true);
       return result;
+    }
+    if (expr.op == '*') {
+      const Expr *operand = nullptr;
+      int factor = 0;
+      if (expr.left->kind == Expr::Kind::Constant) {
+        operand = expr.right.get();
+        factor = expr.left->value;
+      } else if (expr.right->kind == Expr::Kind::Constant) {
+        operand = expr.left.get();
+        factor = expr.right->value;
+      }
+      if (operand) {
+        if (factor == 0) return acquireTemp();
+        if (factor == 1) return emitExpr(*operand);
+        const auto source = emitExpr(*operand);
+        const auto result = acquireTemp();
+        moveTo(source);
+        output_ += "[-";
+        moveTo(result);
+        if (factor <= 128) output_.append(static_cast<std::size_t>(factor), '+');
+        else output_.append(static_cast<std::size_t>(256 - factor), '-');
+        moveTo(source);
+        output_ += ']';
+        releaseTemp(source, true);
+        return result;
+      }
     }
     const auto left = emitExpr(*expr.left);
     const auto right = emitExpr(*expr.right);
     if (expr.op != '*') {
       addConsume(right, left, expr.op == '-');
-      releaseTemp(right);
+      releaseTemp(right, true);
       return left;
     }
-    const auto result = acquireTemp();
-    const auto scratch = acquireTemp();
-    clear(result);
-    moveTo(left); output_ += '['; output_ += '-';
-    copyAdd(right, result, scratch);
-    moveTo(left); output_ += ']';
-    releaseTemp(left);
-    releaseTemp(right);
-    releaseTemp(scratch);
-    return result;
+    return multiply(left, right);
   }
   void emitStatement(const Statement &statement) {
     if (statement.kind == Statement::Kind::Input) {
       moveTo(variableCell(statement.target));
       output_ += ',';
+      return;
+    }
+    if (statement.kind == Statement::Kind::Print &&
+        statement.expr->kind == Expr::Kind::Variable) {
+      moveTo(variableCell(statement.expr->name));
+      output_ += '.';
       return;
     }
     const auto value = emitExpr(*statement.expr);
@@ -429,7 +511,7 @@ private:
       clear(destination);
       addConsume(value, destination, false);
     }
-    releaseTemp(value);
+    releaseTemp(value, statement.kind == Statement::Kind::Assign);
   }
 };
 
@@ -448,7 +530,7 @@ int main(int argc, char *argv[]) {
   try {
     Program program = parseSource(source);
     checkNames(program);
-    foldConstants(program);
+    propagateConstants(program);
     removeDeadAssignments(program);
     BrainfuckEmitter emitter;
     std::string brainfuck = emitter.generate(program);
