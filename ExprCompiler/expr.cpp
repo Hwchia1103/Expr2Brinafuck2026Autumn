@@ -30,6 +30,7 @@ struct Expr {
   Kind kind;
   int value = 0;
   std::string name;
+  std::string cacheKey;
   char op = '\0';
   std::unique_ptr<Expr> left;
   std::unique_ptr<Expr> right;
@@ -332,8 +333,38 @@ void removeDeadAssignments(Program &program) {
   program = std::move(kept);
 }
 
+void countProducts(Expr &expr,
+                   const std::unordered_map<std::string, std::size_t> &versions,
+                   std::unordered_map<std::string, std::size_t> &counts) {
+  if (expr.left) countProducts(*expr.left, versions, counts);
+  if (expr.right) countProducts(*expr.right, versions, counts);
+  if (expr.kind != Expr::Kind::Binary || expr.op != '*' ||
+      expr.left->kind != Expr::Kind::Variable ||
+      expr.right->kind != Expr::Kind::Variable) return;
+  auto left = expr.left->name + "#" + std::to_string(versions.at(expr.left->name));
+  auto right = expr.right->name + "#" + std::to_string(versions.at(expr.right->name));
+  if (right < left) std::swap(left, right);
+  expr.cacheKey = left + "|" + right;
+  ++counts[expr.cacheKey];
+}
+
+std::unordered_map<std::string, std::size_t> repeatedProducts(Program &program) {
+  std::unordered_map<std::string, std::size_t> versions, counts;
+  for (auto &statement : program) {
+    if (statement.expr) countProducts(*statement.expr, versions, counts);
+    if (statement.kind != Statement::Kind::Print) ++versions[statement.target];
+  }
+  for (auto it = counts.begin(); it != counts.end();) {
+    if (it->second < 2) it = counts.erase(it);
+    else ++it;
+  }
+  return counts;
+}
+
 class BrainfuckEmitter {
 public:
+  explicit BrainfuckEmitter(std::unordered_map<std::string, std::size_t> uses)
+      : remaining_(std::move(uses)) {}
   std::string generate(const Program &program) {
     for (const auto &statement : program) emitStatement(statement);
     return std::move(output_);
@@ -346,6 +377,8 @@ private:
   std::size_t nextCell_ = 0;
   std::vector<std::size_t> freeTemps_;
   std::unordered_map<std::string, std::size_t> variableCells_;
+  std::unordered_map<std::string, std::size_t> remaining_;
+  std::unordered_map<std::string, std::size_t> cacheCells_;
 
   std::size_t allocate() {
     if (nextCell_ == tapeSize) throw std::runtime_error("Brainfuck tape exhausted");
@@ -434,6 +467,20 @@ private:
     return result;
   }
   std::size_t emitExpr(const Expr &expr) {
+    if (auto use = remaining_.find(expr.cacheKey); use != remaining_.end()) {
+      const auto cached = cacheCells_.find(expr.cacheKey);
+      if (cached != cacheCells_.end()) {
+        const auto result = acquireTemp();
+        const auto scratch = acquireTemp();
+        copyAdd(cached->second, result, scratch);
+        releaseTemp(scratch, true);
+        if (--use->second == 0) {
+          releaseTemp(cached->second);
+          cacheCells_.erase(cached);
+        }
+        return result;
+      }
+    }
     if (expr.kind == Expr::Kind::Constant) {
       const auto result = acquireTemp();
       setConstant(result, expr.value);
@@ -488,7 +535,16 @@ private:
       releaseTemp(right, true);
       return left;
     }
-    return multiply(left, right);
+    const auto result = multiply(left, right);
+    if (auto use = remaining_.find(expr.cacheKey); use != remaining_.end()) {
+      --use->second;
+      const auto cell = allocate();
+      const auto scratch = acquireTemp();
+      copyAdd(result, cell, scratch);
+      releaseTemp(scratch, true);
+      cacheCells_.emplace(expr.cacheKey, cell);
+    }
+    return result;
   }
   void emitStatement(const Statement &statement) {
     if (statement.kind == Statement::Kind::Input) {
@@ -532,7 +588,7 @@ int main(int argc, char *argv[]) {
     checkNames(program);
     propagateConstants(program);
     removeDeadAssignments(program);
-    BrainfuckEmitter emitter;
+    BrainfuckEmitter emitter(repeatedProducts(program));
     std::string brainfuck = emitter.generate(program);
     std::cout << brainfuck;
     return 0;
